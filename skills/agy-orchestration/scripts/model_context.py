@@ -6,7 +6,7 @@
   1) быстрый разбор `<USER_SETTINGS_CHANGE>` из `transcript.jsonl`;
   2) кэшируемый опрос локального `LanguageServerService` (`GetUserStatus`,
      `GetCascadeTrajectoryGeneratorMetadata` с `generatorMetadataOffset`);
-  3) резервная таблица порогов `512k` / `256k` / `160k` / `128k` / `80k`.
+  3) резервная таблица порогов `840k` / `512k` / `256k` / `160k` / `128k` / `80k`.
 """
 from __future__ import annotations
 
