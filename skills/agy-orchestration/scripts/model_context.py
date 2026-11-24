@@ -182,9 +182,11 @@ def post_ls_rpc_strict(
             raw_txt = r.read().decode("utf-8").strip()
             return int(r.status), (json.loads(raw_txt) if raw_txt else {})
     except urllib.error.HTTPError as exc:
+        code_http = int(exc.code)
         try:
             err_body = exc.read().decode("utf-8", errors="replace").strip()
-            code_http = int(exc.code)
+        except Exception:
+            err_body = ""
         finally:
             exc.close()
         try:
