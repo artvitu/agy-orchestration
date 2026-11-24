@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Общий помощник определения активной модели, пула квот и порога контекстного окна
-для `agy-hook-adapter.py` и `context-meter.py` в Google Antigravity 2.x.
+"""Общий модуль определения активной модели, пула квот, порога контекстного окна
+и подключения к локальному `LanguageServerService` в Google Antigravity Desktop 2.x.
 
-Единая логика с боковым плагином `context-sidecar/main.mjs`:
+Основные механизмы:
   1) быстрый разбор `<USER_SETTINGS_CHANGE>` из `transcript.jsonl`;
   2) кэшируемый опрос локального `LanguageServerService` (`GetUserStatus`,
      `GetCascadeTrajectoryGeneratorMetadata` с `generatorMetadataOffset`);
@@ -15,9 +15,11 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import time
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -65,8 +67,18 @@ def safe_id(raw: str) -> str:
 def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.chmod(path, 0o600)
+        data = json.dumps(payload, ensure_ascii=False)
+        fd, tmp_name = tempfile.mkstemp(prefix=".agy-priv-", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(data)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -126,6 +138,24 @@ def fallback_ceiling_by_model(
     return ARGON_CEILING if max_total > 265000 else default_ceiling
 
 
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _is_loopback_addr(addr: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(f"http://{addr.strip()}")
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return bool(port) and not parsed.path and not parsed.query and not parsed.username
+
+
 def post_ls_rpc_strict(
     addr: str,
     csrf_tok: str,
@@ -136,16 +166,19 @@ def post_ls_rpc_strict(
     """Вызывает RPC `LanguageServerService` и возвращает `(http_status, json_или_ошибка)`.
 
     При сетевой ошибке / таймауте возвращает `(0, текст_ошибки)`.
+    Для защиты локального `csrfToken` запросы разрешены строго на loopback в обход системного `HTTP_PROXY`.
     """
     if not addr or not csrf_tok:
         return 0, "отсутствует адрес или CSRF-токен Language Server"
+    if not _is_loopback_addr(addr):
+        return 0, "отказ безопасности: Language Server разрешён только на локальном адресе (127.0.0.1 / localhost)"
     req = urllib.request.Request(
         f"http://{addr}/exa.language_server_pb.LanguageServerService/{method}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-codeium-csrf-token": csrf_tok},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _NO_PROXY_OPENER.open(req, timeout=timeout) as r:
             raw_txt = r.read().decode("utf-8").strip()
             return int(r.status), (json.loads(raw_txt) if raw_txt else {})
     except urllib.error.HTTPError as exc:

@@ -1,7 +1,7 @@
 {
   "name": "agy-orchestration",
   "displayName": "Antigravity Orchestration (Tabs + Subagents)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+: прямой обмен сообщениями между сессиями боковой панели с очередью WHEN_IDLE (agy-wake.py) и постоянные ролевые субагенты с сохранением горячего кэша.",
   "author": {
     "name": "Artem Ustyuzhanin (Systemno)",

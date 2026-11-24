@@ -119,7 +119,7 @@ def _load_registry(path: Path) -> dict[str, Any]:
         return {
             "schema_version": 1,
             "platform": "Google Antigravity Desktop 2.34+",
-            "workspace": str(ws_root),
+            "project": ws_root.name or "default",
             "roles": {},
         }
     try:

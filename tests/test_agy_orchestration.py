@@ -214,7 +214,11 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
 
     def test_discover_send_queue_spawn_and_delete(self) -> None:
         self.assertEqual(agy_wake.main(["discover", "--from-titles", "--sync", "--yes"]), 0)
-        reg = json.loads(self.reg_path.read_text(encoding="utf-8"))
+        raw_reg = self.reg_path.read_text(encoding="utf-8")
+        self.assertNotIn(str(self.tmp.name), raw_reg)
+        reg = json.loads(raw_reg)
+        self.assertEqual(reg.get("project"), "demo-app")
+        self.assertNotIn("workspace", reg)
         self.assertIn("backend-api", reg["roles"])
         self.assertIn("qa", reg["roles"])
 
@@ -237,6 +241,16 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
                 rc = agy_wake.main(["list"])
             self.assertEqual(rc, 2)
             self.assertIn("TURBO", buf.getvalue())
+
+    def test_loopback_only_and_proxy_bypass(self) -> None:
+        code, msg = mc.post_ls_rpc_strict("example.com:8080", "test-csrf-token", "ListProjects", {}, 1.0)
+        self.assertEqual(code, 0)
+        self.assertIn("отказ безопасности", str(msg))
+
+        with patch.dict(os.environ, {"HTTP_PROXY": "http://localhost:1", "http_proxy": "http://localhost:1"}):
+            code_ok, body_ok = mc.post_ls_rpc_strict(f"127.0.0.1:{self.port}", self.state.csrf, "ListProjects", {}, 2.0)
+            self.assertEqual(code_ok, 200)
+            self.assertIn("projectIds", body_ok)
 
 
 if __name__ == "__main__":
