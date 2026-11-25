@@ -1,8 +1,8 @@
 {
   "name": "agy-orchestration",
   "displayName": "Antigravity Orchestration (Tabs + Subagents)",
-  "version": "1.1.0",
-  "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+ / 2.35+: прямой обмен сообщениями между сессиями без обязательного реестра (автопоиск ролей на лету и автоподхват выгруженных после рестарта IDE вкладок), очередь WHEN_IDLE и постоянные ролевые субагенты.",
+  "version": "1.2.0",
+  "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+ / 2.35+: обмен сообщениями между сессиями без обязательного реестра (работает и в безопасном режиме Auto через встроенные hooks.json, плюс автопоиск ролей, LoadTrajectory после рестарта IDE, WHEN_IDLE и постоянные субагенты).",
   "author": {
     "name": "Artem Ustyuzhanin (Systemno)",
     "url": "https://systemno.com"

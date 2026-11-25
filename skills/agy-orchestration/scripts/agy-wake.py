@@ -26,7 +26,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -34,6 +36,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from typing import Any
 from urllib.parse import unquote
 
@@ -163,6 +166,145 @@ def _save_registry(path: Path, doc: dict[str, Any]) -> None:
             os.unlink(tmp_name)
         except OSError:
             pass
+        raise
+
+
+def _bridge_dir() -> Path:
+    env_p = os.environ.get("AGY_WAKE_BRIDGE_DIR", "").strip()
+    if env_p:
+        return Path(env_p).expanduser().resolve()
+    base = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+    return base / f"agy-wake-bridge-{os.getuid()}"
+
+
+def _ensure_private_dir(path: Path) -> Path:
+    """Создаёт каталог с правами 0o700 и проверяет, что он не подменён симлинком."""
+    if path.is_symlink():
+        raise WakeError(f"Отказ безопасности: {path} является символической ссылкой.", exit_code=2)
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise WakeError(f"Отказ безопасности: {path} является символической ссылкой.", exit_code=2)
+    st = path.stat()
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise WakeError(f"Отказ безопасности: владелец {path} не совпадает с текущим пользователем.", exit_code=2)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def _is_eperm_error(exc: BaseException | str) -> bool:
+    return mc._is_sandbox_eperm(str(exc))
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    _ensure_private_dir(path.parent)
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        try:
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _bridge_snapshot_path() -> Path:
+    return _bridge_dir() / "snapshot.json"
+
+
+def _load_bridge_snapshot(*, max_age: float = 600.0) -> dict[str, Any] | None:
+    path = _bridge_snapshot_path()
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return None
+        ts = float(doc.get("ts") or 0)
+        if max_age > 0 and (time.time() - ts) > max_age:
+            return None
+        if not isinstance(doc.get("rows"), list) or not isinstance(doc.get("projects"), dict):
+            return None
+        return doc
+    except Exception:
+        return None
+
+
+def _write_bridge_snapshot(*, force: bool = False, max_age: float = 4.0) -> dict[str, Any] | None:
+    """Снимает живые сессии и их автослаги для чтения из песочницы Auto-режима."""
+    path = _bridge_snapshot_path()
+    prev = _load_bridge_snapshot(max_age=0.0)
+    if not force and prev and (time.time() - float(prev.get("ts") or 0)) < max_age:
+        return prev
+    prev_by_cid = {
+        str(r.get("cascade_id") or "").lower(): r
+        for r in ((prev or {}).get("rows") or [])
+        if isinstance(r, dict)
+    }
+    try:
+        projects = _fetch_projects()
+        rows = _fetch_all_rows(projects, include_disk=True)
+    except Exception:
+        return prev
+    sorted_idx = sorted(
+        range(len(rows)),
+        key=lambda i: str(rows[i].get("last_modified") or ""),
+        reverse=True,
+    )
+    scanned_budget = 0
+    for idx in sorted_idx:
+        r = rows[idx]
+        if r.get("killed") or r.get("is_subagent"):
+            continue
+        cid_low = str(r.get("cascade_id") or "").lower()
+        old = prev_by_cid.get(cid_low)
+        if (
+            old
+            and old.get("last_modified") == r.get("last_modified")
+            and int(old.get("step_count") or 0) == int(r.get("step_count") or 0)
+            and old.get("title") == r.get("title")
+            and "auto_slug" in old
+        ):
+            r["auto_slug"] = old["auto_slug"]
+        elif scanned_budget < 60:
+            scanned_budget += 1
+            slug, _ = _scan_slug_for_session(r, from_titles=False)
+            r["auto_slug"] = slug
+    snap = {"schema_version": 1, "ts": time.time(), "projects": projects, "rows": rows}
+    try:
+        _atomic_write_json(path, snap)
+    except Exception:
+        return prev
+    return snap
+
+
+def _fetch_projects_and_rows(
+    *,
+    include_disk: bool = True,
+    allow_bridge_fallback: bool = True,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], bool]:
+    try:
+        projects = _fetch_projects()
+        rows = _fetch_all_rows(projects, include_disk=include_disk)
+        return projects, rows, False
+    except WakeError as exc:
+        if allow_bridge_fallback and _is_eperm_error(exc):
+            snap = _load_bridge_snapshot()
+            if snap:
+                rows = list(snap["rows"])
+                if not include_disk:
+                    rows = [r for r in rows if r.get("loaded", True)]
+                return snap["projects"], rows, True
         raise
 
 
@@ -633,6 +775,9 @@ def _scan_slug_from_transcript(cid: str) -> tuple[str, str]:
 
 
 def _scan_slug_for_session(row: dict[str, Any], *, from_titles: bool = False) -> tuple[str, str]:
+    cached_slug = str(row.get("auto_slug") or "").strip()
+    if cached_slug:
+        return cached_slug, "Автопоиск по снимку моста"
     slug, note = _scan_slug_from_transcript(row["cascade_id"])
     if slug:
         return slug, note
@@ -654,8 +799,9 @@ def _emit(data: Any, *, as_json: bool) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    projects = _fetch_projects()
-    rows = _fetch_all_rows(projects, include_disk=not bool(getattr(args, "loaded_only", False)))
+    projects, rows, from_bridge = _fetch_projects_and_rows(
+        include_disk=not bool(getattr(args, "loaded_only", False)),
+    )
     rows = [r for r in rows if not r.get("killed")]
     if not args.include_subagents:
         rows = [r for r in rows if not r["is_subagent"]]
@@ -668,8 +814,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     if args.limit > 0:
         rows = rows[: args.limit]
     if args.json:
-        _emit({"count": len(rows), "sessions": rows}, as_json=True)
+        out: dict[str, Any] = {"count": len(rows), "sessions": rows}
+        if from_bridge:
+            out["cached_bridge"] = True
+        _emit(out, as_json=True)
         return 0
+    if from_bridge:
+        print("[снимок моста Auto] показаны последние данные от хоста (127.0.0.1 закрыт песочницей):")
     for r in rows:
         sub_mark = " [sub]" if r["is_subagent"] else ""
         steps_s = f"{r['step_count']:4d}ш" if r.get("loaded", True) else "  disk"
@@ -678,9 +829,9 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_find(args: argparse.Namespace) -> int:
-    projects = _fetch_projects()
+    projects, rows_all, from_bridge = _fetch_projects_and_rows(include_disk=True)
     q = args.query.strip().lower()
-    rows = [r for r in _fetch_all_rows(projects) if not r.get("killed")]
+    rows = [r for r in rows_all if not r.get("killed")]
     if not args.include_subagents:
         rows = [r for r in rows if not r["is_subagent"]]
     matched = [
@@ -690,7 +841,10 @@ def cmd_find(args: argparse.Namespace) -> int:
     ]
     matched.sort(key=lambda r: r["last_modified"], reverse=True)
     if args.json:
-        _emit({"count": len(matched), "sessions": matched}, as_json=True)
+        out: dict[str, Any] = {"count": len(matched), "sessions": matched}
+        if from_bridge:
+            out["cached_bridge"] = True
+        _emit(out, as_json=True)
         return 0
     for r in matched:
         print(f"{r['cascade_id']} | {r['status']:7s} | {r['project_name']:14s} | {r['title']}")
@@ -700,16 +854,23 @@ def cmd_find(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     reg_path = _registry_path(args.registry)
     reg = _load_registry(reg_path)
-    projects = _fetch_projects()
-    rows = _fetch_all_rows(projects)
+    projects, rows, from_bridge = _fetch_projects_and_rows(include_disk=True)
     row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=reg)
-    row = _ensure_loaded(row, projects)
-    model = _session_model_info(row["cascade_id"])
-    last_reply = _extract_last_planner_reply(row["cascade_id"])
+    if from_bridge:
+        model = {"code": "", "label": "", "pool": "google"}
+        last_reply = {"response": ""}
+    else:
+        row = _ensure_loaded(row, projects)
+        model = _session_model_info(row["cascade_id"])
+        last_reply = _extract_last_planner_reply(row["cascade_id"])
     out = {**row, "slug": matched_slug, "model": model, "last_reply_preview": last_reply.get("response", "")[:300]}
+    if from_bridge:
+        out["cached_bridge"] = True
     if args.json:
         _emit(out, as_json=True)
         return 0
+    if from_bridge:
+        print("[снимок моста Auto] краткий статус из кэша хоста:")
     print(f"ID:      {out['cascade_id']}")
     if matched_slug:
         print(f"Роль:    {matched_slug}")
@@ -726,8 +887,8 @@ def cmd_registry(args: argparse.Namespace) -> int:
     reg_path = _registry_path(args.registry)
     reg = _load_registry(reg_path)
     roles = reg.get("roles") or {}
-    projects = _fetch_projects()
-    by_cid = {r["cascade_id"].lower(): r for r in _fetch_all_rows(projects)}
+    _, rows_all, from_bridge = _fetch_projects_and_rows(include_disk=True)
+    by_cid = {r["cascade_id"].lower(): r for r in rows_all}
     rows_out: list[dict[str, Any]] = []
     for slug in sorted(roles):
         rec = roles[slug] if isinstance(roles[slug], dict) else {}
@@ -751,7 +912,10 @@ def cmd_registry(args: argparse.Namespace) -> int:
             "note": rec.get("note") or "",
         })
     if args.json:
-        _emit({"registry_path": str(reg_path), "count": len(rows_out), "roles": rows_out}, as_json=True)
+        out: dict[str, Any] = {"registry_path": str(reg_path), "count": len(rows_out), "roles": rows_out}
+        if from_bridge:
+            out["cached_bridge"] = True
+        _emit(out, as_json=True)
         return 0
     if not rows_out:
         print(f"Локальный реестр {reg_path} пуст (роли распознаются на лету автоматически; `bind` нужен только при дублях).")
@@ -828,8 +992,11 @@ def cmd_discover(args: argparse.Namespace) -> int:
     reg_path = _registry_path(args.registry)
     reg = _load_registry(reg_path)
     roles = reg.setdefault("roles", {})
-    projects = _fetch_projects()
-    rows = [r for r in _fetch_all_rows(projects) if not r.get("killed") and not r["is_subagent"]]
+    projects, rows_all, from_bridge = _fetch_projects_and_rows(
+        include_disk=True,
+        allow_bridge_fallback=not bool(args.sync and args.yes),
+    )
+    rows = [r for r in rows_all if not r.get("killed") and not r["is_subagent"]]
 
     proj_filter = args.project
     if not proj_filter and not args.all_projects:
@@ -924,15 +1091,91 @@ def cmd_preset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _queue_send_outbox(args: argparse.Namespace, raw_text: str) -> str:
+    """Кладёт запрос отправки в локальный outbox моста Auto-режима."""
+    outbox_dir = _ensure_private_dir(_bridge_dir() / "outbox")
+    req_id = f"{int(time.time() * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    envelope = {
+        "schema_version": 1,
+        "req_id": req_id,
+        "created_at": time.time(),
+        "to": args.to,
+        "text": raw_text,
+        "sender": getattr(args, "sender", "") or "",
+        "project": getattr(args, "project", "") or "",
+        "registry": getattr(args, "registry", "") or "",
+        "model": getattr(args, "model", "") or "",
+        "queue": bool(getattr(args, "queue", False)),
+        "wait": int(getattr(args, "wait", 0) or 0),
+        "cooldown": int(getattr(args, "cooldown", DEFAULT_COOLDOWN_SEC)),
+        "no_cooldown": bool(getattr(args, "no_cooldown", False)),
+        "allow_self": bool(getattr(args, "allow_self", False)),
+        "ignore_budget": bool(getattr(args, "ignore_budget", False)),
+        "cwd": str(Path.cwd()),
+        "conversation_id": str(os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or ""),
+    }
+    _atomic_write_json(outbox_dir / f"{req_id}.json", envelope)
+    return req_id
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     raw_text = _read_message_input(args.text, args.body_file)
     reg = _load_registry(_registry_path(args.registry))
-    projects = _fetch_projects()
-    rows = _fetch_all_rows(projects)
+    sender = (args.sender or "").strip()
+    msg_text = _format_signal_text(raw_text, sender)
+
+    try:
+        projects = _fetch_projects()
+        rows = _fetch_all_rows(projects)
+    except WakeError as exc:
+        if not _is_eperm_error(exc) or os.environ.get("AGY_WAKE_BRIDGE_DISABLE") == "1":
+            raise
+        if not args.yes:
+            snap = _load_bridge_snapshot()
+            if not snap:
+                raise
+            row, matched_slug = _resolve_session(
+                args.to,
+                snap["rows"],
+                project_filter=args.project or "",
+                projects=snap["projects"],
+                registry=reg,
+            )
+            preview = {
+                "dry_run": True,
+                "cached_bridge": True,
+                "action": "send",
+                "target": row,
+                "matched_slug": matched_slug,
+                "text": msg_text,
+            }
+            if args.json:
+                _emit(preview, as_json=True)
+            else:
+                print(f"[DRY-RUN, снимок Auto] Отправка в {row['short_id']} [{row['project_name']}] {row['title']} ({row['status']})")
+                print(f"Текст:  {msg_text}")
+                print("Для реальной отправки добавь флаг `--yes` (доставится через мост PostToolUse).")
+            return 0
+        req_id = _queue_send_outbox(args, raw_text)
+        res_bridge = {
+            "sent": False,
+            "queued_for_host_hook": True,
+            "request_id": req_id,
+            "to": args.to,
+            "sender": sender,
+        }
+        if args.json:
+            _emit(res_bridge, as_json=True)
+        else:
+            print(
+                f"[мост Auto] Сессия-отправитель в песочнице; сигнал для `{args.to}` поставлен в локальную очередь "
+                f"({req_id}) и будет отправлен хуком PostToolUse сразу после команды (отчёт придёт на следующем шаге)."
+            )
+        return 0
+
     row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=reg)
     row = _ensure_loaded(row, projects)
     cid = row["cascade_id"]
-    sender = (args.sender or "").strip()
 
     if sender and not args.allow_self:
         if sender == matched_slug or sender.lower() == cid.lower():
@@ -945,7 +1188,6 @@ def cmd_send(args: argparse.Namespace) -> int:
     cur_model = _session_model_info(cid)
     override_model = _resolve_model(args.model) if args.model else None
     effective_pool = (override_model or cur_model).get("pool") or "google"
-    msg_text = _format_signal_text(raw_text, sender)
     was_running = row["status"] == "RUNNING"
 
     if was_running and not args.queue:
@@ -1193,6 +1435,164 @@ def cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def _append_bridge_result(conv_id: str, text: str) -> None:
+    results_dir = _ensure_private_dir(_bridge_dir() / "results")
+    key = mc.safe_id(conv_id) if (conv_id or "").strip() else "_global"
+    target = results_dir / f"{key}.jsonl"
+    line = json.dumps({"ts": time.time(), "text": text}, ensure_ascii=False) + "\n"
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _drain_bridge_results(conv_id: str) -> list[str]:
+    results_dir = _bridge_dir() / "results"
+    if not results_dir.is_dir() or results_dir.is_symlink():
+        return []
+    keys = [mc.safe_id(conv_id)] if (conv_id or "").strip() else []
+    if "_global" not in keys:
+        keys.append("_global")
+    out: list[str] = []
+    for key in keys:
+        src = results_dir / f"{key}.jsonl"
+        if not src.is_file() or src.is_symlink():
+            continue
+        claimed = results_dir / f".drain-{key}-{os.getpid()}-{uuid.uuid4().hex[:6]}.jsonl"
+        try:
+            os.replace(src, claimed)
+        except OSError:
+            continue
+        try:
+            for line in claimed.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                    txt = str(item.get("text") or "").strip()
+                    if txt:
+                        out.append(txt)
+                except Exception:
+                    pass
+        finally:
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+    return out
+
+
+def _process_bridge_outbox(caller_conv_id: str = "") -> int:
+    outbox_dir = _bridge_dir() / "outbox"
+    if not outbox_dir.is_dir() or outbox_dir.is_symlink():
+        return 0
+    files = sorted(outbox_dir.glob("*.json"))
+    if not files:
+        return 0
+    proc_dir = _ensure_private_dir(_bridge_dir() / "processing")
+    processed = 0
+    for fpath in files[:20]:
+        claimed = proc_dir / f"{fpath.stem}-{os.getpid()}-{uuid.uuid4().hex[:6]}.json"
+        try:
+            os.replace(fpath, claimed)
+        except OSError:
+            continue
+        processed += 1
+        target_cid = caller_conv_id
+        try:
+            env_doc = json.loads(claimed.read_text(encoding="utf-8"))
+            if not target_cid:
+                target_cid = str(env_doc.get("conversation_id") or "")
+            send_args = argparse.Namespace(
+                to=str(env_doc.get("to") or ""),
+                text=str(env_doc.get("text") or ""),
+                body_file=None,
+                sender=str(env_doc.get("sender") or ""),
+                project=str(env_doc.get("project") or ""),
+                registry=str(env_doc.get("registry") or ""),
+                model=str(env_doc.get("model") or ""),
+                queue=bool(env_doc.get("queue", False)),
+                wait=int(env_doc.get("wait") or 0),
+                cooldown=int(env_doc.get("cooldown", DEFAULT_COOLDOWN_SEC)),
+                no_cooldown=bool(env_doc.get("no_cooldown", False)),
+                allow_self=bool(env_doc.get("allow_self", False)),
+                ignore_budget=bool(env_doc.get("ignore_budget", False)),
+                yes=True,
+                json=False,
+            )
+            old_cwd = Path.cwd()
+            req_cwd = str(env_doc.get("cwd") or "").strip()
+            buf_out = io.StringIO()
+            try:
+                if req_cwd and Path(req_cwd).is_dir():
+                    os.chdir(req_cwd)
+                with redirect_stdout(buf_out):
+                    cmd_send(send_args)
+            finally:
+                try:
+                    os.chdir(old_cwd)
+                except OSError:
+                    pass
+            msg = buf_out.getvalue().strip() or f"Отправлено в {send_args.to}."
+            _append_bridge_result(target_cid, f"📡 Мост agy-wake (Auto): {msg}")
+        except WakeError as exc:
+            _append_bridge_result(target_cid, f"⚠️ Мост agy-wake (Auto): ОШИБКА: {exc}")
+        except Exception as exc:
+            _append_bridge_result(target_cid, f"⚠️ Мост agy-wake (Auto): сбой доставки: {exc}")
+        finally:
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+    return processed
+
+
+def handle_hook(event_name: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Единый обработчик событий IDE для моста Auto-режима (без привязок к конкретному проекту)."""
+    payload = data if isinstance(data, dict) else {}
+    ev = (event_name or str(payload.get("hookEventName") or "")).strip()
+    conv_id = str(payload.get("conversationId") or "")
+    if ev == "SessionStart":
+        _write_bridge_snapshot(force=True)
+        return {}
+    if ev == "PostToolUse":
+        count = _process_bridge_outbox(caller_conv_id=conv_id)
+        if count > 0:
+            _write_bridge_snapshot(force=True)
+        return {}
+    if ev == "PreInvocation":
+        _write_bridge_snapshot(force=False, max_age=4.0)
+        msgs = _drain_bridge_results(conv_id)
+        if not msgs:
+            return {}
+        return {"injectSteps": [{"systemMessage": {"systemMessage": "\n".join(msgs)}}]}
+    return {}
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    raw = ""
+    try:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+    except Exception:
+        raw = ""
+    data: dict[str, Any] = {}
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+    try:
+        out = handle_hook(args.event, data)
+    except Exception:
+        out = {}
+    sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Управление и пробуждение сессий Google Antigravity Desktop через локальный RPC.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1304,6 +1704,10 @@ def build_parser() -> argparse.ArgumentParser:
     pd.add_argument("--yes", action="store_true")
     pd.add_argument("--json", action="store_true")
     pd.set_defaults(func=cmd_delete)
+
+    ph = sub.add_parser("hook", help="Обработчик событий Antigravity (мост Auto-режима без TURBO)")
+    ph.add_argument("--event", default="", help="SessionStart, PostToolUse или PreInvocation")
+    ph.set_defaults(func=cmd_hook)
     return p
 
 

@@ -193,15 +193,17 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
             encoding="utf-8",
         )
         self.state_dir = Path(self.tmp.name) / "state"
+        self.bridge_dir = Path(self.tmp.name) / "bridge"
         self.reg_path = Path(self.tmp.name) / "sessions.json"
         self.brain_dir = Path(self.tmp.name) / "brain"
         self._old_env = {k: os.environ.get(k) for k in (
             "ANTIGRAVITY_DAEMON_DIR", "ANTIGRAVITY_LS_ADDRESS", "ANTIGRAVITY_CSRF_TOKEN",
-            "AGY_SESSIONS_FILE", "AGY_WAKE_STATE_DIR", "AGY_BRAIN_DIR", "WORKSPACE_ROOT",
+            "AGY_SESSIONS_FILE", "AGY_WAKE_STATE_DIR", "AGY_WAKE_BRIDGE_DIR", "AGY_BRAIN_DIR", "WORKSPACE_ROOT",
         )}
         os.environ["ANTIGRAVITY_DAEMON_DIR"] = str(self.daemon_dir)
         os.environ["AGY_SESSIONS_FILE"] = str(self.reg_path)
         os.environ["AGY_WAKE_STATE_DIR"] = str(self.state_dir)
+        os.environ["AGY_WAKE_BRIDGE_DIR"] = str(self.bridge_dir)
         os.environ["AGY_BRAIN_DIR"] = str(self.brain_dir)
         os.environ["WORKSPACE_ROOT"] = str(Path(self.tmp.name) / "demo-app")
         os.environ.pop("ANTIGRAVITY_LS_ADDRESS", None)
@@ -223,6 +225,9 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
         self.assertEqual(len(manifest["suggestedPrompts"]), 3)
         self.assertTrue((PLUGIN_ROOT / manifest["logo"]).is_file())
         self.assertTrue((PLUGIN_ROOT / "LICENSE").is_file())
+        self.assertTrue((PLUGIN_ROOT / "hooks.json").is_file())
+        hooks_cfg = json.loads((PLUGIN_ROOT / "hooks.json").read_text(encoding="utf-8"))
+        self.assertIn("agy-orchestration-auto-bridge", hooks_cfg)
         self.assertTrue((PLUGIN_ROOT / "rules/AGENTS.md").is_file())
         self.assertTrue((PLUGIN_ROOT / "skills/agy-orchestration/SKILL.md").is_file())
 

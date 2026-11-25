@@ -1,0 +1,30 @@
+{
+  "agy-orchestration-auto-bridge": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./skills/agy-orchestration/scripts/agy-wake.py hook --event SessionStart",
+        "timeout": 10
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./skills/agy-orchestration/scripts/agy-wake.py hook --event PostToolUse",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./skills/agy-orchestration/scripts/agy-wake.py hook --event PreInvocation",
+        "timeout": 10
+      }
+    ]
+  }
+}
