@@ -70,6 +70,8 @@ class _FakeLSState:
                 {"type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE", "status": "CORTEX_STEP_STATUS_DONE", "plannerResponse": {"response": "OK"}},
             ]
         }
+        self.unloaded_store: dict[str, dict] = {}
+        self.search_results: list[dict] = []
 
 
 def _make_handler(state: _FakeLSState):
@@ -110,6 +112,18 @@ def _make_handler(state: _FakeLSState):
                 resp = {"projects": state.projects}
             elif method == "GetAllCascadeTrajectories":
                 resp = {"trajectorySummaries": state.trajectories}
+            elif method == "SearchConversations":
+                resp = {"results": state.search_results}
+            elif method == "LoadTrajectory":
+                cid = payload.get("cascadeId", "")
+                if cid in state.unloaded_store:
+                    state.trajectories[cid] = state.unloaded_store.pop(cid)
+                    resp = {}
+                elif cid in state.trajectories:
+                    resp = {}
+                else:
+                    code = 500
+                    resp = {"code": "internal", "message": f"trajectory {cid} not found"}
             elif method == "GetUserStatus":
                 resp = {
                     "userStatus": {
@@ -251,6 +265,32 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
             code_ok, body_ok = mc.post_ls_rpc_strict(f"127.0.0.1:{self.port}", self.state.csrf, "ListProjects", {}, 2.0)
             self.assertEqual(code_ok, 200)
             self.assertIn("projectIds", body_ok)
+
+    def test_lazy_load_after_restart_and_registryless_slug_resolution(self) -> None:
+        unloaded_cid = "55555555-5555-5555-5555-555555555555"
+        self.state.unloaded_store[unloaded_cid] = {
+            "summary": "QA Agent",
+            "stepCount": 9,
+            "status": "CASCADE_RUN_STATUS_IDLE",
+            "lastModifiedTime": "2026-11-25T08:00:00Z",
+            "annotations": {"title": "QA Agent"},
+            "trajectoryMetadata": {"projectId": "proj-demo"},
+        }
+        self.state.search_results.append({
+            "cascadeId": unloaded_cid,
+            "title": "QA Agent",
+            "workspaceName": "demo-app",
+            "lastModifiedTime": "2026-11-25T08:00:00Z",
+        })
+        tp = self.brain_dir / unloaded_cid / ".system_generated/logs/transcript.jsonl"
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        tp.write_text('{"source":"USER_EXPLICIT","type":"USER_INPUT","content":"[role:qa-disk]"}\n', encoding="utf-8")
+
+        # Реестр пуст: роли находятся на лету и выгруженная сессия подгружается через LoadTrajectory
+        self.assertEqual(agy_wake.main(["send", "--to", "qa-disk", "--from", "backend", "--text", "после рестарта", "--yes"]), 0)
+        self.assertIn(("LoadTrajectory", {"cascadeId": unloaded_cid}), self.state.calls)
+        send_calls = [p for m, p in self.state.calls if m == "SendUserCascadeMessage"]
+        self.assertEqual(send_calls[-1]["cascadeId"], unloaded_cid)
 
 
 if __name__ == "__main__":

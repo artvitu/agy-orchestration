@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import unquote
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -45,6 +46,7 @@ import model_context as mc  # noqa: E402
 
 DEFAULT_STATE_DIR = Path.home() / ".gemini/antigravity/cache/agy-wake"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$", re.IGNORECASE)
 SLUG_MARKER_RE = re.compile(
     r"(?:/(?:resume-chat|new-chat)\s+|\[role:|@role:)([a-z0-9][a-z0-9_-]{0,62})",
     re.IGNORECASE,
@@ -96,16 +98,25 @@ def _brain_dir() -> Path:
     return Path(env_p).expanduser().resolve() if env_p else (Path.home() / ".gemini/antigravity/brain")
 
 
+def _conversations_dir() -> Path:
+    env_p = os.environ.get("AGY_CONVERSATIONS_DIR", "").strip()
+    if env_p:
+        return Path(env_p).expanduser().resolve()
+    return _brain_dir().parent / "conversations"
+
+
+def _conversation_file_exists(cid: str) -> bool:
+    cdir = _conversations_dir()
+    return (cdir / f"{cid}.db").is_file() or (cdir / f"{cid}.pb").is_file()
+
+
 def _registry_path(explicit: str = "") -> Path:
-    """Выбирает путь к реестру сессий без загрязнения чужого git-репозитория."""
+    """Выбирает путь к локальному реестру сессий без загрязнения git-репозитория."""
     if (explicit or "").strip():
         return Path(explicit).expanduser().resolve()
     env_p = os.environ.get("AGY_SESSIONS_FILE", "").strip()
     if env_p:
         return Path(env_p).expanduser().resolve()
-    sibling = SCRIPT_DIR / "agy-sessions.json"
-    if sibling.is_file():
-        return sibling
     ws_root = _detect_workspace_root()
     ws_reg = ws_root / ".agents/agy-sessions.json"
     if ws_reg.is_file():
@@ -212,6 +223,16 @@ def _fetch_trajectories() -> dict[str, dict[str, Any]]:
     return _rpc("GetAllCascadeTrajectories", {}).get("trajectorySummaries") or {}
 
 
+def _fetch_unloaded_search(limit: int = 500) -> list[dict[str, Any]]:
+    """Запрашивает индекс всех сохранённых сессий через `SearchConversations` (для 2.35+ lazy load)."""
+    code, body = mc.call_ls_rpc_strict("SearchConversations", {"query": "", "limit": limit}, state_dir=None, timeout=5.0)
+    if code == 200 and isinstance(body, dict):
+        res = body.get("results")
+        if isinstance(res, list):
+            return [r for r in res if isinstance(r, dict)]
+    return []
+
+
 def _extract_session_row(
     cid: str,
     info: dict[str, Any],
@@ -236,6 +257,7 @@ def _extract_session_row(
         "title": title,
         "status": short_status,
         "raw_status": raw_status,
+        "loaded": True,
         "project_id": pid,
         "project_name": proj_name,
         "parent_conversation_id": parent_cid,
@@ -247,6 +269,60 @@ def _extract_session_row(
         "created_time": str(info.get("createdTime") or ""),
         "workspaces": workspaces,
     }
+
+
+def _fetch_all_rows(projects: dict[str, dict[str, Any]], *, include_disk: bool = True) -> list[dict[str, Any]]:
+    """Объединяет загруженные в память сессии и выгруженные с диска (`SearchConversations`)."""
+    sums = _fetch_trajectories()
+    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items()]
+    if not include_disk:
+        return rows
+
+    proj_by_name = {
+        str(p.get("name") or "").strip().lower(): (pid, str(p.get("name") or "").strip())
+        for pid, p in projects.items()
+        if str(p.get("name") or "").strip()
+    }
+    seen = {cid.lower() for cid in sums}
+    for item in _fetch_unloaded_search():
+        cid = str(item.get("cascadeId") or "").strip()
+        if not cid or cid.lower() in seen:
+            continue
+        seen.add(cid.lower())
+        raw_ws = unquote(str(item.get("workspaceName") or "").strip())
+        pid, pname = proj_by_name.get(raw_ws.lower(), ("", raw_ws or "Conversations"))
+        rows.append({
+            "cascade_id": cid,
+            "short_id": cid[:8],
+            "title": str(item.get("title") or "(без названия)").strip(),
+            "status": "ON_DISK",
+            "raw_status": "ON_DISK",
+            "loaded": False,
+            "project_id": pid,
+            "project_name": pname,
+            "parent_conversation_id": "",
+            "is_subagent": False,
+            "killed": False,
+            "permission_preset": "",
+            "step_count": 0,
+            "last_modified": str(item.get("lastModifiedTime") or ""),
+            "created_time": "",
+            "workspaces": [],
+        })
+    return rows
+
+
+def _ensure_loaded(row: dict[str, Any], projects: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Подгружает выгруженную после рестарта IDE сессию в память `language_server` через `LoadTrajectory`."""
+    if row.get("loaded", True):
+        return row
+    cid = row["cascade_id"]
+    _rpc("LoadTrajectory", {"cascadeId": cid}, timeout=15.0)
+    sums = _fetch_trajectories()
+    info = sums.get(cid)
+    if not info:
+        raise WakeError(f"Сессия {cid[:8]} не появилась в памяти после LoadTrajectory.", exit_code=1)
+    return _extract_session_row(cid, info, projects)
 
 
 def _match_project_filter(row: dict[str, Any], project_query: str) -> bool:
@@ -304,10 +380,12 @@ def _resolve_session(
     rows: list[dict[str, Any]],
     *,
     project_filter: str = "",
+    projects: dict[str, dict[str, Any]] | None = None,
     registry: dict[str, Any] | None = None,
     include_subagents: bool = False,
+    allow_auto_slug: bool = True,
 ) -> tuple[dict[str, Any], str]:
-    """Ищет сессию по роли из реестра, UUID, префиксу UUID или заголовку.
+    """Ищет сессию по явному реестру, UUID, префиксу, заголовку или слагом на лету.
 
     Возвращает `(row, matched_slug)`.
     """
@@ -321,7 +399,7 @@ def _resolve_session(
         reg_cid = str(rec.get("cascade_id") or "").strip()
         if not reg_cid:
             raise WakeError(
-                f"Роль `{q}` отвязана в реестре (`cascade_id` пуст). Выполни `bind` или `spawn`.",
+                f"Роль `{q}` отвязана в реестре (`cascade_id` пуст). Выполни `bind`, `spawn` или удали ключ из реестра.",
                 exit_code=2,
             )
         by_cid = {r["cascade_id"].lower(): r for r in rows}
@@ -351,6 +429,28 @@ def _resolve_session(
     exact_title = [r for r in scoped if r["title"].lower() == ql]
     if len(exact_title) == 1:
         return exact_title[0], ""
+
+    if allow_auto_slug and SLUG_RE.match(q):
+        slug_pool = scoped
+        if not project_filter and projects:
+            auto_proj = _auto_project_query(projects)
+            auto_scoped = [r for r in pool if _match_project_filter(r, auto_proj)]
+            if auto_scoped:
+                slug_pool = auto_scoped
+        slug_hits: list[dict[str, Any]] = []
+        for r in sorted(slug_pool, key=lambda x: x.get("last_modified") or "", reverse=True):
+            scanned, _ = _scan_slug_for_session(r, from_titles=False)
+            if scanned == ql:
+                slug_hits.append(r)
+        if len(slug_hits) == 1:
+            return slug_hits[0], ql
+        if len(slug_hits) > 1:
+            preview = "; ".join(f"{r['short_id']} [{r['project_name']}] {r['title']}" for r in slug_hits[:6])
+            raise WakeError(
+                f"Роль `{q}` найдена сразу в нескольких сессиях ({len(slug_hits)}): {preview}. "
+                f"Закрепи нужную вручную: `agy-wake.py bind --slug {q} --to <uuid> --yes`.",
+                exit_code=2,
+            )
 
     substr = [
         r
@@ -511,16 +611,24 @@ def _scan_slug_from_transcript(cid: str) -> tuple[str, str]:
     tp = _brain_dir() / cid / ".system_generated/logs/transcript.jsonl"
     if not tp.is_file():
         return "", ""
+    fallback = ""
     try:
         with open(tp, encoding="utf-8", errors="replace") as fh:
             for idx, line in enumerate(fh):
                 if idx > 120:
                     break
                 m = SLUG_MARKER_RE.search(line)
-                if m:
-                    return m.group(1).lower(), "Автопоиск по маркеру в транскрипте"
+                if not m:
+                    continue
+                slug = m.group(1).lower()
+                if '"USER_INPUT"' in line or '"USER_EXPLICIT"' in line:
+                    return slug, "Автопоиск по маркеру в транскрипте"
+                if not fallback:
+                    fallback = slug
     except OSError:
         return "", ""
+    if fallback:
+        return fallback, "Автопоиск по маркеру в транскрипте"
     return "", ""
 
 
@@ -547,8 +655,8 @@ def _emit(data: Any, *, as_json: bool) -> None:
 
 def cmd_list(args: argparse.Namespace) -> int:
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items() if not info.get("killed")]
+    rows = _fetch_all_rows(projects, include_disk=not bool(getattr(args, "loaded_only", False)))
+    rows = [r for r in rows if not r.get("killed")]
     if not args.include_subagents:
         rows = [r for r in rows if not r["is_subagent"]]
     if args.project:
@@ -564,15 +672,15 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 0
     for r in rows:
         sub_mark = " [sub]" if r["is_subagent"] else ""
-        print(f"{r['short_id']} | {r['status']:7s} | {r['project_name']:14s} | {r['step_count']:4d}ш | {r['title']}{sub_mark}")
+        steps_s = f"{r['step_count']:4d}ш" if r.get("loaded", True) else "  disk"
+        print(f"{r['short_id']} | {r['status']:7s} | {r['project_name']:14s} | {steps_s} | {r['title']}{sub_mark}")
     return 0
 
 
 def cmd_find(args: argparse.Namespace) -> int:
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
     q = args.query.strip().lower()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items() if not info.get("killed")]
+    rows = [r for r in _fetch_all_rows(projects) if not r.get("killed")]
     if not args.include_subagents:
         rows = [r for r in rows if not r["is_subagent"]]
     matched = [
@@ -593,9 +701,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     reg_path = _registry_path(args.registry)
     reg = _load_registry(reg_path)
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items()]
-    row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", registry=reg)
+    rows = _fetch_all_rows(projects)
+    row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=reg)
+    row = _ensure_loaded(row, projects)
     model = _session_model_info(row["cascade_id"])
     last_reply = _extract_last_planner_reply(row["cascade_id"])
     out = {**row, "slug": matched_slug, "model": model, "last_reply_preview": last_reply.get("response", "")[:300]}
@@ -619,33 +727,34 @@ def cmd_registry(args: argparse.Namespace) -> int:
     reg = _load_registry(reg_path)
     roles = reg.get("roles") or {}
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
+    by_cid = {r["cascade_id"].lower(): r for r in _fetch_all_rows(projects)}
     rows_out: list[dict[str, Any]] = []
     for slug in sorted(roles):
         rec = roles[slug] if isinstance(roles[slug], dict) else {}
         cid = str(rec.get("cascade_id") or "").strip()
-        info = sums.get(cid)
+        row = by_cid.get(cid.lower()) if cid else None
         if not cid:
             st = "UNBOUND"
-        elif not info or info.get("killed"):
-            st = "MISSING"
+        elif row and not row.get("killed"):
+            st = row["status"]
+        elif _conversation_file_exists(cid):
+            st = "ON_DISK"
         else:
-            st = str(info.get("status") or "").removeprefix("CASCADE_RUN_STATUS_") or "UNKNOWN"
-        row = _extract_session_row(cid, info, projects) if info else {}
+            st = "MISSING"
         rows_out.append({
             "slug": slug,
             "cascade_id": cid,
             "status": st,
-            "title": row.get("title") or rec.get("title") or "",
-            "project_name": row.get("project_name") or "",
-            "permission_preset": row.get("permission_preset") or "",
+            "title": (row or {}).get("title") or rec.get("title") or "",
+            "project_name": (row or {}).get("project_name") or "",
+            "permission_preset": (row or {}).get("permission_preset") or "",
             "note": rec.get("note") or "",
         })
     if args.json:
         _emit({"registry_path": str(reg_path), "count": len(rows_out), "roles": rows_out}, as_json=True)
         return 0
     if not rows_out:
-        print(f"Реестр {reg_path} пока пуст (выполни `discover --sync --yes` или `bind`).")
+        print(f"Локальный реестр {reg_path} пуст (роли распознаются на лету автоматически; `bind` нужен только при дублях).")
         return 0
     for r in rows_out:
         sid = r["cascade_id"][:8] if r["cascade_id"] else "-"
@@ -657,9 +766,9 @@ def cmd_bind(args: argparse.Namespace) -> int:
     reg_path = _registry_path(args.registry)
     reg = _load_registry(reg_path)
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items()]
-    row, _ = _resolve_session(args.to, rows, project_filter=args.project or "", registry=None)
+    rows = _fetch_all_rows(projects)
+    row, _ = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=None)
+    row = _ensure_loaded(row, projects)
     if row["is_subagent"]:
         raise WakeError("Нельзя привязать дочернего субагента в реестр постоянных сессий.", exit_code=2)
     slug = args.slug.strip()
@@ -720,9 +829,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     reg = _load_registry(reg_path)
     roles = reg.setdefault("roles", {})
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items() if not info.get("killed")]
-    rows = [r for r in rows if not r["is_subagent"]]
+    rows = [r for r in _fetch_all_rows(projects) if not r.get("killed") and not r["is_subagent"]]
 
     proj_filter = args.project
     if not proj_filter and not args.all_projects:
@@ -795,9 +902,9 @@ def cmd_discover(args: argparse.Namespace) -> int:
 def cmd_preset(args: argparse.Namespace) -> int:
     reg = _load_registry(_registry_path(args.registry))
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items()]
-    row, _ = _resolve_session(args.to, rows, project_filter=args.project or "", registry=reg)
+    rows = _fetch_all_rows(projects)
+    row, _ = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=reg)
+    row = _ensure_loaded(row, projects)
     preset_enum = PRESET_MAP[args.preset]
     if not args.yes:
         if args.json:
@@ -821,9 +928,9 @@ def cmd_send(args: argparse.Namespace) -> int:
     raw_text = _read_message_input(args.text, args.body_file)
     reg = _load_registry(_registry_path(args.registry))
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    rows = [_extract_session_row(cid, info, projects) for cid, info in sums.items()]
-    row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", registry=reg)
+    rows = _fetch_all_rows(projects)
+    row, matched_slug = _resolve_session(args.to, rows, project_filter=args.project or "", projects=projects, registry=reg)
+    row = _ensure_loaded(row, projects)
     cid = row["cascade_id"]
     sender = (args.sender or "").strip()
 
@@ -945,6 +1052,11 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     msg_text = _format_signal_text(raw_text, args.sender or "")
     preset_enum = PRESET_MAP[args.preset] if args.preset else ""
     bind_slug = (args.slug or "").strip()
+    if bind_slug:
+        has_title_slug = bool(TITLE_BRACKET_SLUG_RE.match(args.title or ""))
+        m_text = SLUG_MARKER_RE.search(msg_text)
+        if not has_title_slug and (not m_text or m_text.group(1).lower() != bind_slug.lower()):
+            msg_text = f"{msg_text.rstrip()}\n\n[role:{bind_slug}]"
 
     if not args.yes:
         preview = {
@@ -1042,10 +1154,12 @@ def cmd_delete(args: argparse.Namespace) -> int:
             exit_code=2,
         )
     projects = _fetch_projects()
-    sums = _fetch_trajectories()
-    if cid not in sums:
+    rows = _fetch_all_rows(projects)
+    by_cid = {r["cascade_id"].lower(): r for r in rows}
+    row = by_cid.get(cid.lower())
+    if not row:
         raise WakeError(f"Сессия {cid} не найдена.")
-    row = _extract_session_row(cid, sums[cid], projects)
+    row = _ensure_loaded(row, projects)
     if row["status"] == "RUNNING":
         raise WakeError(f"Нельзя удалить работающую (RUNNING) сессию {cid}.", exit_code=2)
     if not args.yes:
@@ -1085,7 +1199,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     pl = sub.add_parser("list", help="Список сессий")
     pl.add_argument("--project", default="", help="Фильтр по имени или ID проекта")
-    pl.add_argument("--status", default="", help="Фильтр по статусу (IDLE, RUNNING)")
+    pl.add_argument("--status", default="", help="Фильтр по статусу (IDLE, RUNNING, ON_DISK)")
+    pl.add_argument("--loaded-only", action="store_true", help="Показывать только уже загруженные в память сессии")
     pl.add_argument("--include-subagents", action="store_true", help="Показывать дочерних субагентов")
     pl.add_argument("--limit", type=int, default=30, help="Сколько последних сессий показать (0 = все)")
     pl.add_argument("--json", action="store_true")

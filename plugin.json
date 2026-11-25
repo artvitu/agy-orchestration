@@ -1,8 +1,8 @@
 {
   "name": "agy-orchestration",
   "displayName": "Antigravity Orchestration (Tabs + Subagents)",
-  "version": "1.0.1",
-  "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+: прямой обмен сообщениями между сессиями боковой панели с очередью WHEN_IDLE (agy-wake.py) и постоянные ролевые субагенты с сохранением горячего кэша.",
+  "version": "1.1.0",
+  "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+ / 2.35+: прямой обмен сообщениями между сессиями без обязательного реестра (автопоиск ролей на лету и автоподхват выгруженных после рестарта IDE вкладок), очередь WHEN_IDLE и постоянные ролевые субагенты.",
   "author": {
     "name": "Artem Ustyuzhanin (Systemno)",
     "url": "https://systemno.com"
@@ -11,7 +11,7 @@
   "repository": "https://github.com/artvitu/agy-orchestration",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Покажи живые сессии текущего проекта в Antigravity и собери реестр ролей из их заголовков",
+    "Покажи все сессии текущего проекта в Antigravity (включая выгруженные ON_DISK после рестарта)",
     "Создай в текущем проекте новую рабочую сессию с пресетом turbo под роль тестировщика",
     "Подними внутри этой сессии постоянного субагента-инспектора на модели flash и сохрани его conversationId"
   ]
