@@ -638,6 +638,27 @@ def _resolve_model(model_query: str) -> dict[str, str]:
     raise WakeError(f"Найдено несколько моделей по запросу {q!r}: {cand}")
 
 
+def _resolve_default_model() -> dict[str, str]:
+    """Возвращает модель по умолчанию из `GetUserStatus` (или первую доступную не-orchestrator модель) для старта пустой сессии."""
+    catalog = mc.fetch_model_catalog(state_dir=None, ttl_sec=0, timeout=5.0)
+    by_code = catalog.get("by_code") or {}
+    default_code = str(catalog.get("default_code") or "").strip()
+    if default_code:
+        if default_code in by_code:
+            return by_code[default_code]
+        pool = "3p" if mc.is_third_party_text(default_code) else "google"
+        label = str(catalog.get("default_label") or default_code)
+        return {"code": default_code, "label": label, "pool": pool}
+    entries = list(by_code.values())
+    for ent in entries:
+        lbl = str(ent.get("label") or "").lower()
+        if ent.get("pool") == "google" and "orchestrator" not in lbl:
+            return ent
+    if entries:
+        return entries[0]
+    raise WakeError("Не удалось определить модель по умолчанию для новой сессии: передай `--model` явно.", exit_code=2)
+
+
 def _session_model_info(cid: str) -> dict[str, str]:
     catalog = mc.fetch_model_catalog(state_dir=None, ttl_sec=300, timeout=5.0)
     meta = mc.fetch_trajectory_meta(cid, state_dir=None, ttl_sec=0, timeout=5.0)
@@ -1187,6 +1208,8 @@ def cmd_send(args: argparse.Namespace) -> int:
 
     cur_model = _session_model_info(cid)
     override_model = _resolve_model(args.model) if args.model else None
+    if not override_model and not cur_model.get("code"):
+        override_model = _resolve_default_model()
     effective_pool = (override_model or cur_model).get("pool") or "google"
     was_running = row["status"] == "RUNNING"
 
@@ -1290,7 +1313,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         target_project_id = pid
         target_project_name = pname
 
-    model_info = _resolve_model(args.model) if args.model else None
+    model_info = _resolve_model(args.model) if args.model else _resolve_default_model()
     msg_text = _format_signal_text(raw_text, args.sender or "")
     preset_enum = PRESET_MAP[args.preset] if args.preset else ""
     bind_slug = (args.slug or "").strip()

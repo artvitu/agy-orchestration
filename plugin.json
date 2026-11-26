@@ -1,7 +1,7 @@
 {
   "name": "agy-orchestration",
   "displayName": "Antigravity Orchestration (Tabs + Subagents)",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Двухэтажная оркестрация в Google Antigravity Desktop 2.34+ / 2.35+: обмен сообщениями между сессиями без обязательного реестра (работает и в безопасном режиме Auto через встроенные hooks.json, плюс автопоиск ролей, LoadTrajectory после рестарта IDE, WHEN_IDLE и постоянные субагенты).",
   "author": {
     "name": "Artem Ustyuzhanin (Systemno)",

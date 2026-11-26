@@ -128,9 +128,11 @@ def _make_handler(state: _FakeLSState):
                 resp = {
                     "userStatus": {
                         "cascadeModelConfigData": {
+                            "defaultOverrideModelConfig": {"modelOrAlias": {"model": "MODEL_PLACEHOLDER_M532"}},
                             "clientModelConfigs": [
                                 {"label": "Gemini 4 Hydrogen (Low)", "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M527"}},
-                            ]
+                                {"label": "Gemini 4 Neon (High)", "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M532"}},
+                            ],
                         }
                     }
                 }
@@ -296,6 +298,15 @@ class TestAgyOrchestrationPlugin(unittest.TestCase):
         self.assertIn(("LoadTrajectory", {"cascadeId": unloaded_cid}), self.state.calls)
         send_calls = [p for m, p in self.state.calls if m == "SendUserCascadeMessage"]
         self.assertEqual(send_calls[-1]["cascadeId"], unloaded_cid)
+
+    def test_spawn_without_model_picks_default_override_model(self) -> None:
+        self.assertEqual(
+            agy_wake.main(["spawn", "--title", "[qa] Новая", "--slug", "qa-default", "--text", "Привет", "--yes"]),
+            0,
+        )
+        send_calls = [p for m, p in self.state.calls if m == "SendUserCascadeMessage"]
+        model = send_calls[-1]["cascadeConfig"]["plannerConfig"]["requestedModel"]["model"]
+        self.assertEqual(model, "MODEL_PLACEHOLDER_M532")
 
 
 if __name__ == "__main__":
